@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-AMI Email Ingest Service (FINAL)
---------------------------------
-• Fetch unread emails
+AMI Email Ingest Service
+------------------------
+• Fetch unread emails via IMAP (provider-agnostic)
 • Extract PDF attachments
 • Upload PDFs to Supabase Storage
-• Create report rows with doctor_email (no hardcoding)
-• Fully compatible with email + manual workflows
+• Create report rows with user_id = NULL
+• Ownership resolved automatically on login
 """
 
 import os
@@ -19,14 +19,15 @@ from supabase import create_client, Client
 # ==============================
 # ENVIRONMENT
 # ==============================
-EMAIL_HOST = "imap.gmail.com"
-EMAIL_USER = "ami.health.alerts@gmail.com"
-EMAIL_PASS = os.getenv("AMI_EMAIL_PASSWORD")
+IMAP_HOST = os.getenv("IMAP_HOST")
+IMAP_USER = os.getenv("IMAP_USER")
+IMAP_PASS = os.getenv("IMAP_PASS")
+IMAP_FOLDER = os.getenv("IMAP_FOLDER", "INBOX")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-if not all([EMAIL_PASS, SUPABASE_URL, SUPABASE_KEY]):
+if not all([IMAP_HOST, IMAP_USER, IMAP_PASS, SUPABASE_URL, SUPABASE_KEY]):
     raise RuntimeError("Missing required environment variables")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -46,17 +47,17 @@ def normalise_email(addr: str) -> str:
 def extract_sender_email(msg):
     frm = msg.get("From", "")
     parsed = email.utils.parseaddr(frm)[1]
-    return normalise_email(parsed)
+    return normalise_email(parsed) if parsed else None
 
 # ==============================
 # MAIN INGEST LOOP
 # ==============================
 def main():
-    print("[AMI] Email ingest service running (FINAL)")
+    print("[AMI] Email ingest service running")
 
-    mail = imaplib.IMAP4_SSL(EMAIL_HOST)
-    mail.login(EMAIL_USER, EMAIL_PASS)
-    mail.select("inbox")
+    mail = imaplib.IMAP4_SSL(IMAP_HOST)
+    mail.login(IMAP_USER, IMAP_PASS)
+    mail.select(IMAP_FOLDER)
 
     while True:
         try:
@@ -71,9 +72,9 @@ def main():
                     continue
 
                 msg = email.message_from_bytes(data[0][1])
-                doctor_email = extract_sender_email(msg)
+                sender_email = extract_sender_email(msg)
 
-                if not doctor_email:
+                if not sender_email:
                     print("⚠️ Skipping email without sender")
                     mail.store(num, "+FLAGS", "\\Seen")
                     continue
@@ -91,11 +92,11 @@ def main():
                         continue
 
                     storage_path = (
-                        f"incoming/{doctor_email}/"
+                        f"email/{sender_email}/"
                         f"{utc_stamp()}_{filename}"
                     )
 
-                    print(f"[AMI] Uploading to storage: {storage_path}")
+                    print(f"[AMI] Uploading PDF → {storage_path}")
 
                     supabase.storage.from_(STORAGE_BUCKET).upload(
                         storage_path,
@@ -103,13 +104,14 @@ def main():
                         {"content-type": "application/pdf"}
                     )
 
-                    # Create report record (doctor_id intentionally NULL)
+                    # IMPORTANT: user_id intentionally NULL
                     supabase.table("reports").insert({
-                        "doctor_email": doctor_email,
-                        "doctor_id": None,
+                        "user_id": None,
+                        "source": "email",
+                        "source_email": sender_email,
                         "file_path": storage_path,
                         "ai_status": "pending",
-                        "ingest_source": "email"
+                        "received_at": datetime.utcnow().isoformat()
                     }).execute()
 
                     print("[AMI] Report queued → worker will process")
