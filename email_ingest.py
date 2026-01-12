@@ -35,9 +35,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 # ==============================
 # TEMP DEBUG (SAFE)
 # ==============================
-print("[DEBUG] AMI_EMAIL_PASSWORD present:", bool(EMAIL_PASS))
-print("[DEBUG] SUPABASE_URL present:", bool(SUPABASE_URL))
-print("[DEBUG] SUPABASE_SERVICE_KEY present:", bool(SUPABASE_KEY))
+
 
 if not all([EMAIL_PASS, SUPABASE_URL, SUPABASE_KEY]):
     raise RuntimeError("Missing required environment variables")
