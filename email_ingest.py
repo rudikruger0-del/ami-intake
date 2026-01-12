@@ -1,39 +1,44 @@
 #!/usr/bin/env python3
 """
-AMI Email Ingest Service
-------------------------
-• Fetch unread emails via IMAP (provider-agnostic)
+AMI Email Ingest Service (PRODUCTION)
+------------------------------------
+• Poll AMI ingest mailbox via IMAP
 • Extract PDF attachments
 • Upload PDFs to Supabase Storage
-• Create report rows with user_id = NULL
-• Ownership resolved automatically on login
+• Insert reports with source_email
+• Permanently delete email after ingestion (POPIA-safe)
+• Auto-reconnect IMAP to prevent server shutdown errors
 """
 
 import os
 import imaplib
 import email
 import time
+import uuid
 from datetime import datetime
-from supabase import create_client, Client
+from supabase import create_client
 
 # ==============================
-# ENVIRONMENT
+# EMAIL CONFIG (AMI MAILBOX)
 # ==============================
-IMAP_HOST = os.getenv("IMAP_HOST")
-IMAP_USER = os.getenv("IMAP_USER")
-IMAP_PASS = os.getenv("IMAP_PASS")
-IMAP_FOLDER = os.getenv("IMAP_FOLDER", "INBOX")
+EMAIL_HOST = "fennec.aserv.co.za"
+EMAIL_PORT = 993
+EMAIL_USER = "ami.health.labs@amihealth.co.za"
+EMAIL_PASS = os.getenv("AMI_EMAIL_PASSWORD")
 
+# ==============================
+# SUPABASE CONFIG
+# ==============================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-if not all([IMAP_HOST, IMAP_USER, IMAP_PASS, SUPABASE_URL, SUPABASE_KEY]):
+if not all([EMAIL_PASS, SUPABASE_URL, SUPABASE_KEY]):
     raise RuntimeError("Missing required environment variables")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 STORAGE_BUCKET = "reports"
-POLL_SECONDS = 10
+POLL_SECONDS = 15
 
 # ==============================
 # HELPERS
@@ -47,17 +52,21 @@ def normalise_email(addr: str) -> str:
 def extract_sender_email(msg):
     frm = msg.get("From", "")
     parsed = email.utils.parseaddr(frm)[1]
-    return normalise_email(parsed) if parsed else None
+    return normalise_email(parsed)
+
+def connect_mailbox():
+    mail = imaplib.IMAP4_SSL(EMAIL_HOST, EMAIL_PORT)
+    mail.login(EMAIL_USER, EMAIL_PASS)
+    mail.select("INBOX")
+    return mail
 
 # ==============================
-# MAIN INGEST LOOP
+# MAIN LOOP
 # ==============================
 def main():
-    print("[AMI] Email ingest service running")
+    print("[AMI] Email ingest service running (PRODUCTION)")
 
-    mail = imaplib.IMAP4_SSL(IMAP_HOST)
-    mail.login(IMAP_USER, IMAP_PASS)
-    mail.select(IMAP_FOLDER)
+    mail = connect_mailbox()
 
     while True:
         try:
@@ -66,17 +75,20 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
+            processed_any = False
+
             for num in messages[0].split():
                 status, data = mail.fetch(num, "(RFC822)")
                 if status != "OK":
                     continue
 
                 msg = email.message_from_bytes(data[0][1])
-                sender_email = extract_sender_email(msg)
+                source_email = extract_sender_email(msg)
 
-                if not sender_email:
+                if not source_email:
                     print("⚠️ Skipping email without sender")
-                    mail.store(num, "+FLAGS", "\\Seen")
+                    mail.store(num, "+FLAGS", "\\Deleted")
+                    processed_any = True
                     continue
 
                 for part in msg.walk():
@@ -92,8 +104,8 @@ def main():
                         continue
 
                     storage_path = (
-                        f"email/{sender_email}/"
-                        f"{utc_stamp()}_{filename}"
+                        f"incoming/{source_email}/"
+                        f"{utc_stamp()}_{uuid.uuid4()}_{filename}"
                     )
 
                     print(f"[AMI] Uploading PDF → {storage_path}")
@@ -101,33 +113,41 @@ def main():
                     supabase.storage.from_(STORAGE_BUCKET).upload(
                         storage_path,
                         pdf_bytes,
-                        {"content-type": "application/pdf"}
+                        {"content-type": "application/pdf"},
                     )
 
-                    # IMPORTANT: user_id intentionally NULL
                     supabase.table("reports").insert({
-                        "user_id": None,
-                        "source": "email",
-                        "source_email": sender_email,
                         "file_path": storage_path,
                         "ai_status": "pending",
-                        "received_at": datetime.utcnow().isoformat()
+                        "ingest_source": "email",
+                        "source_email": source_email,
+                        "user_id": None,
                     }).execute()
 
-                    print("[AMI] Report queued → worker will process")
+                    print("[AMI] Report inserted → worker will process")
 
-                mail.store(num, "+FLAGS", "\\Seen")
-                print("[AMI] Email processed and marked as SEEN")
+                # Mark email for deletion (POPIA-safe)
+                mail.store(num, "+FLAGS", "\\Deleted")
+                processed_any = True
+                print("[AMI] Email marked for deletion")
+
+            # Permanently delete emails + reset IMAP
+            if processed_any:
+                mail.expunge()
+                mail.logout()
+                mail = connect_mailbox()
+                print("[AMI] Mailbox expunged and reconnected")
 
             time.sleep(POLL_SECONDS)
 
-        except KeyboardInterrupt:
-            print("\n[AMI] Shutting down ingest service")
-            break
         except Exception as e:
             print("❌ INGEST ERROR:", e)
-            time.sleep(5)
+            try:
+                mail.logout()
+            except:
+                pass
+            time.sleep(10)
+            mail = connect_mailbox()
 
 if __name__ == "__main__":
     main()
-
