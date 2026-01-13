@@ -7,7 +7,7 @@ AMI Email Ingest Service (PRODUCTION)
 • Upload PDFs to Supabase Storage
 • Insert reports with source_email
 • Permanently delete email after ingestion (POPIA-safe)
-• Auto-reconnect IMAP to prevent server shutdown errors
+• Robust IMAP lifecycle handling (no stalled connections)
 """
 
 import os
@@ -31,11 +31,6 @@ EMAIL_PASS = os.getenv("AMI_EMAIL_PASSWORD")
 # ==============================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-
-# ==============================
-# TEMP DEBUG (SAFE)
-# ==============================
-
 
 if not all([EMAIL_PASS, SUPABASE_URL, SUPABASE_KEY]):
     raise RuntimeError("Missing required environment variables")
@@ -69,21 +64,21 @@ def connect_mailbox():
     return mail
 
 # ==============================
-# MAIN LOOP
+# MAIN LOOP (IMAP-SAFE)
 # ==============================
 def main():
     print("[AMI] Email ingest service running (PRODUCTION)")
 
-    mail = connect_mailbox()
-
     while True:
+        mail = None
         try:
+            # 🔒 Always start with a fresh IMAP connection
+            mail = connect_mailbox()
+
             status, messages = mail.search(None, "UNSEEN")
             if status != "OK":
                 time.sleep(POLL_SECONDS)
                 continue
-
-            processed_any = False
 
             for num in messages[0].split():
                 status, data = mail.fetch(num, "(RFC822)")
@@ -96,7 +91,6 @@ def main():
                 if not source_email:
                     print("⚠️ Skipping email without sender")
                     mail.store(num, "+FLAGS", "\\Deleted")
-                    processed_any = True
                     continue
 
                 for part in msg.walk():
@@ -134,28 +128,28 @@ def main():
 
                     print("[AMI] Report inserted → worker will process")
 
-                # Mark email for deletion (POPIA-safe)
+                # POPIA-safe deletion (ONLY after successful ingest)
                 mail.store(num, "+FLAGS", "\\Deleted")
-                processed_any = True
                 print("[AMI] Email marked for deletion")
 
-            # Permanently delete emails + reset IMAP
-            if processed_any:
-                mail.expunge()
-                mail.logout()
-                mail = connect_mailbox()
-                print("[AMI] Mailbox expunged and reconnected")
-
-            time.sleep(POLL_SECONDS)
+            # Permanently remove processed emails
+            mail.expunge()
+            print("[AMI] Mailbox expunged")
 
         except Exception as e:
             print("❌ INGEST ERROR:", e)
+            time.sleep(10)
+
+        finally:
+            # 🔒 Always close IMAP connection
             try:
-                mail.logout()
+                if mail:
+                    mail.logout()
+                    print("[AMI] Mailbox connection closed")
             except:
                 pass
-            time.sleep(10)
-            mail = connect_mailbox()
+
+        time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
     main()
