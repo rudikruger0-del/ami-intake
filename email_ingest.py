@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-AMI Email Ingest Service (PRODUCTION – HARDENED)
-------------------------------------------------
+AMI Email Ingest Service (PRODUCTION)
+------------------------------------
 • Poll AMI ingest mailbox via IMAP
-• Extract ALL PDF attachments (supports multiple PDFs per email)
+• Extract PDF attachments
 • Upload PDFs to Supabase Storage
 • Insert reports with source_email
-• Delete email ONLY after successful ingestion
-• Reconnect IMAP every poll (no long-lived sockets)
-• Backoff on failures (prevents hammering + bans)
+• Permanently delete email after ingestion (POPIA-safe)
+• Resilient IMAP connection handling (24/7 safe)
 """
 
 import os
@@ -16,18 +15,20 @@ import imaplib
 import email
 import time
 import uuid
-import socket
-from datetime import datetime
+from datetime import datetime, timezone
 from supabase import create_client
 
 # ==============================
-# CONFIG
+# EMAIL CONFIG (AMI MAILBOX)
 # ==============================
 EMAIL_HOST = "fennec.aserv.co.za"
 EMAIL_PORT = 993
 EMAIL_USER = "ami.health.labs@amihealth.co.za"
 EMAIL_PASS = os.getenv("AMI_EMAIL_PASSWORD")
 
+# ==============================
+# SUPABASE CONFIG
+# ==============================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
@@ -37,15 +38,14 @@ if not all([EMAIL_PASS, SUPABASE_URL, SUPABASE_KEY]):
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 STORAGE_BUCKET = "reports"
-
 POLL_SECONDS = 15
-FAIL_BACKOFF_SECONDS = 30
+RECONNECT_DELAY = 15  # seconds (IMAP server friendly)
 
 # ==============================
 # HELPERS
 # ==============================
 def utc_stamp():
-    return datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
 def normalise_email(addr: str) -> str:
     return addr.strip().lower()
@@ -56,9 +56,6 @@ def extract_sender_email(msg):
     return normalise_email(parsed)
 
 def connect_mailbox():
-    # Short socket timeout prevents hangs
-    socket.setdefaulttimeout(20)
-
     mail = imaplib.IMAP4_SSL(EMAIL_HOST, EMAIL_PORT)
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("INBOX")
@@ -70,20 +67,22 @@ def connect_mailbox():
 def main():
     print("[AMI] Email ingest service running (PRODUCTION)")
 
+    mail = None
+
     while True:
-        mail = None
         try:
-            mail = connect_mailbox()
+            # Ensure connection exists
+            if mail is None:
+                mail = connect_mailbox()
 
             status, messages = mail.search(None, "UNSEEN")
             if status != "OK":
-                mail.logout()
                 time.sleep(POLL_SECONDS)
                 continue
 
-            msg_ids = messages[0].split()
+            processed_any = False
 
-            for num in msg_ids:
+            for num in messages[0].split():
                 status, data = mail.fetch(num, "(RFC822)")
                 if status != "OK":
                     continue
@@ -93,10 +92,10 @@ def main():
 
                 if not source_email:
                     mail.store(num, "+FLAGS", "\\Deleted")
+                    processed_any = True
                     continue
 
-                pdf_found = False
-
+                # ---- Handle ALL PDF attachments (multi-PDF safe) ----
                 for part in msg.walk():
                     if part.get_content_maintype() != "application":
                         continue
@@ -108,8 +107,6 @@ def main():
                     pdf_bytes = part.get_payload(decode=True)
                     if not pdf_bytes:
                         continue
-
-                    pdf_found = True
 
                     storage_path = (
                         f"incoming/{source_email}/"
@@ -132,29 +129,34 @@ def main():
                         "user_id": None,
                     }).execute()
 
-                # Delete ONLY if we processed at least one PDF
-                if pdf_found:
-                    mail.store(num, "+FLAGS", "\\Deleted")
-                    print("[AMI] Email processed & marked for deletion")
+                    print("[AMI] Report inserted → worker will process")
 
-            # Permanently remove deleted emails
-            mail.expunge()
-            mail.logout()
+                # Mark email for deletion ONLY after all PDFs processed
+                mail.store(num, "+FLAGS", "\\Deleted")
+                processed_any = True
+                print("[AMI] Email processed & marked for deletion")
+
+            # Expunge ONLY (do not logout/reconnect)
+            if processed_any:
+                mail.expunge()
 
             time.sleep(POLL_SECONDS)
 
         except Exception as e:
             print("❌ INGEST ERROR:", e)
 
+            # Clean reconnect with backoff
             try:
                 if mail:
                     mail.logout()
             except:
                 pass
 
-            # Backoff prevents server bans + runaway loops
-            time.sleep(FAIL_BACKOFF_SECONDS)
+            mail = None
+            time.sleep(RECONNECT_DELAY)
 
+# ==============================
+# ENTRYPOINT
 # ==============================
 if __name__ == "__main__":
     main()
