@@ -2,12 +2,12 @@
 """
 AMI Email Ingest Service (PRODUCTION)
 ------------------------------------
-• Poll AMI ingest mailbox via IMAP
-• Extract PDF attachments
+• Poll AMI ingest mailbox via IMAP (stateless, reconnect every cycle)
+• Extract ALL PDF attachments (handles forwarded emails)
 • Upload PDFs to Supabase Storage
 • Insert reports with source_email
-• Permanently delete email after ingestion (POPIA-safe)
-• Resilient IMAP connection handling (24/7 safe)
+• Permanently delete emails after successful ingestion (POPIA-safe)
+• Resilient to IMAP timeouts, server restarts, and network issues
 """
 
 import os
@@ -15,31 +15,29 @@ import imaplib
 import email
 import time
 import uuid
+import socket
 from datetime import datetime, timezone
 from supabase import create_client
 
 # ==============================
-# EMAIL CONFIG (AMI MAILBOX)
+# CONFIG
 # ==============================
 EMAIL_HOST = "fennec.aserv.co.za"
 EMAIL_PORT = 993
 EMAIL_USER = "ami.health.labs@amihealth.co.za"
 EMAIL_PASS = os.getenv("AMI_EMAIL_PASSWORD")
 
-# ==============================
-# SUPABASE CONFIG
-# ==============================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+STORAGE_BUCKET = "reports"
+POLL_SECONDS = 20
+MAX_BACKOFF = 300  # 5 minutes max backoff
 
 if not all([EMAIL_PASS, SUPABASE_URL, SUPABASE_KEY]):
     raise RuntimeError("Missing required environment variables")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-STORAGE_BUCKET = "reports"
-POLL_SECONDS = 15
-RECONNECT_DELAY = 15  # seconds (IMAP server friendly)
 
 # ==============================
 # HELPERS
@@ -51,12 +49,12 @@ def normalise_email(addr: str) -> str:
     return addr.strip().lower()
 
 def extract_sender_email(msg):
-    frm = msg.get("From", "")
-    parsed = email.utils.parseaddr(frm)[1]
-    return normalise_email(parsed)
+    hdr = msg.get("From", "")
+    parsed = email.utils.parseaddr(hdr)[1]
+    return normalise_email(parsed) if parsed else "unknown_sender"
 
 def connect_mailbox():
-    mail = imaplib.IMAP4_SSL(EMAIL_HOST, EMAIL_PORT)
+    mail = imaplib.IMAP4_SSL(EMAIL_HOST, EMAIL_PORT, timeout=30)
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("INBOX")
     return mail
@@ -67,96 +65,100 @@ def connect_mailbox():
 def main():
     print("[AMI] Email ingest service running (PRODUCTION)")
 
-    mail = None
+    backoff = POLL_SECONDS
 
     while True:
+        mail = None
         try:
-            # Ensure connection exists
-            if mail is None:
-                mail = connect_mailbox()
+            mail = connect_mailbox()
 
-            status, messages = mail.search(None, "UNSEEN")
+            # SEARCH ALL — not UNSEEN (forwarded mails often break UNSEEN)
+            status, messages = mail.search(None, "ALL")
             if status != "OK":
+                raise RuntimeError("IMAP SEARCH failed")
+
+            message_ids = messages[0].split()
+            if not message_ids:
+                backoff = POLL_SECONDS
                 time.sleep(POLL_SECONDS)
                 continue
 
-            processed_any = False
-
-            for num in messages[0].split():
-                status, data = mail.fetch(num, "(RFC822)")
-                if status != "OK":
+            for msg_id in message_ids:
+                status, data = mail.fetch(msg_id, "(RFC822)")
+                if status != "OK" or not data:
                     continue
 
                 msg = email.message_from_bytes(data[0][1])
                 source_email = extract_sender_email(msg)
 
-                if not source_email:
-                    mail.store(num, "+FLAGS", "\\Deleted")
-                    processed_any = True
-                    continue
+                pdf_count = 0
 
-                # ---- Handle ALL PDF attachments (multi-PDF safe) ----
                 for part in msg.walk():
-                    if part.get_content_maintype() != "application":
-                        continue
-
+                    content_type = part.get_content_type()
                     filename = part.get_filename()
-                    if not filename or not filename.lower().endswith(".pdf"):
-                        continue
 
-                    pdf_bytes = part.get_payload(decode=True)
-                    if not pdf_bytes:
-                        continue
+                    if (
+                        content_type == "application/pdf"
+                        or (filename and filename.lower().endswith(".pdf"))
+                    ):
+                        pdf_bytes = part.get_payload(decode=True)
+                        if not pdf_bytes:
+                            continue
 
-                    storage_path = (
-                        f"incoming/{source_email}/"
-                        f"{utc_stamp()}_{uuid.uuid4()}_{filename}"
-                    )
+                        pdf_count += 1
+                        storage_path = (
+                            f"incoming/{source_email}/"
+                            f"{utc_stamp()}_{uuid.uuid4()}_{filename or 'report.pdf'}"
+                        )
 
-                    print(f"[AMI] Uploading PDF → {storage_path}")
+                        print(f"[AMI] Uploading PDF → {storage_path}")
 
-                    supabase.storage.from_(STORAGE_BUCKET).upload(
-                        storage_path,
-                        pdf_bytes,
-                        {"content-type": "application/pdf"},
-                    )
+                        supabase.storage.from_(STORAGE_BUCKET).upload(
+                            storage_path,
+                            pdf_bytes,
+                            {"content-type": "application/pdf"},
+                        )
 
-                    supabase.table("reports").insert({
-                        "file_path": storage_path,
-                        "ai_status": "pending",
-                        "ingest_source": "email",
-                        "source_email": source_email,
-                        "user_id": None,
-                    }).execute()
+                        supabase.table("reports").insert({
+                            "file_path": storage_path,
+                            "ai_status": "pending",
+                            "ingest_source": "email",
+                            "source_email": source_email,
+                            "user_id": None,
+                        }).execute()
 
-                    print("[AMI] Report inserted → worker will process")
+                if pdf_count > 0:
+                    mail.store(msg_id, "+FLAGS", "\\Deleted")
+                    print(f"[AMI] Email processed ({pdf_count} PDFs) & marked for deletion")
+                else:
+                    print("[AMI] No PDFs found — leaving email untouched")
 
-                # Mark email for deletion ONLY after all PDFs processed
-                mail.store(num, "+FLAGS", "\\Deleted")
-                processed_any = True
-                print("[AMI] Email processed & marked for deletion")
+            # PERMANENT DELETE (POPIA)
+            mail.expunge()
+            backoff = POLL_SECONDS
 
-            # Expunge ONLY (do not logout/reconnect)
-            if processed_any:
-                mail.expunge()
-
-            time.sleep(POLL_SECONDS)
+        except (
+            imaplib.IMAP4.error,
+            socket.timeout,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ) as e:
+            print("❌ INGEST ERROR:", e)
+            backoff = min(backoff * 2, MAX_BACKOFF)
 
         except Exception as e:
-            print("❌ INGEST ERROR:", e)
+            print("❌ UNEXPECTED ERROR:", e)
+            backoff = min(backoff * 2, MAX_BACKOFF)
 
-            # Clean reconnect with backoff
+        finally:
             try:
                 if mail:
                     mail.logout()
-            except:
+            except Exception:
                 pass
 
-            mail = None
-            time.sleep(RECONNECT_DELAY)
+            time.sleep(backoff)
 
-# ==============================
-# ENTRYPOINT
-# ==============================
 if __name__ == "__main__":
     main()
